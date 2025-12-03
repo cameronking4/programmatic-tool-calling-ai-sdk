@@ -77,11 +77,12 @@ import EfficiencyMetricsDisplay from './EfficiencyMetrics';
 
 // Suggested prompts for empty state
 const SUGGESTED_PROMPTS = [
-  "Get 5 users and calculate their average score (user1, user2 ... user10)",
-  "Fetch user data and find those with score above 50 + return a list of the top 3 by score",
-  "Provide a list of today's top voted products on producthunt.com", "Fetch top posts from hackernews.com and return a list with posts with more than 100 points",
-  "Get the weather NYC, SF & London using execute code",
-  "List and demo tools (don't use httpbin.org)"
+  "List Azure subscriptions and any with cost alerts or overruns.",
+  "Inventory VMs: OS, status, monitoring, backup missing.",
+  "Find underutilized VMs/disks/IPs last 30 days; suggest savings.",
+  "Summarize Owner/Contributor assignments on subscriptions/groups.",
+  "Show Defender security recommendations and new vulnerabilities.",
+  "List App Services/DBs without diagnostics, suggest fixes."
 ];
 
 // Extended message type to include tool calls and code executions
@@ -109,6 +110,7 @@ export default function ChatInterface() {
   const [gatewayModels, setGatewayModels] = useState<GatewayModel[]>([]);
   const [pendingToolCalls, setPendingToolCalls] = useState<ToolCall[]>([]);
   const [pendingCodeExecution, setPendingCodeExecution] = useState<CodeExecution | null>(null);
+  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
   const [modelSelectorOpen, setModelSelectorOpen] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -215,6 +217,8 @@ export default function ChatInterface() {
       const assistantMessageId = (Date.now() + 1).toString();
       let receivedToolCalls: ToolCall[] = [];
       let receivedCodeExecution: CodeExecution | null = null;
+      const streamingToolCalls = new Map<string, ToolCall>(); // Track tool calls as they stream in
+      let toolCallBuffer = ''; // Buffer for incomplete tool call JSON
 
       const assistantMessage: ExtendedMessage = {
         id: assistantMessageId,
@@ -223,6 +227,7 @@ export default function ChatInterface() {
         timestamp: new Date(),
       };
 
+      setStreamingMessageId(assistantMessageId);
       setMessages((prev) => [...prev, assistantMessage]);
 
       if (reader) {
@@ -232,7 +237,51 @@ export default function ChatInterface() {
 
           const chunk = decoder.decode(value, { stream: true });
 
-          if (chunk.includes('__METADATA__:')) {
+          // Handle tool call events (streamed in real-time)
+          if (chunk.includes('__TOOL_CALL__:')) {
+            // Combine buffer with new chunk
+            const fullChunk = toolCallBuffer + chunk;
+            toolCallBuffer = '';
+            
+            // Split by tool call markers
+            const parts = fullChunk.split(/__TOOL_CALL__:/);
+            let textContent = parts[0]; // Text before first tool call
+            
+            // Process each tool call event
+            for (let i = 1; i < parts.length; i++) {
+              const part = parts[i];
+              // Find where JSON ends (either at newline or end of string)
+              const jsonEnd = part.indexOf('\n');
+              
+              if (jsonEnd > 0) {
+                // Complete JSON found
+                const jsonStr = part.substring(0, jsonEnd);
+                try {
+                  const event = JSON.parse(jsonStr.trim());
+                  if (event.type === 'tool-call' && event.data) {
+                    const toolCall: ToolCall = {
+                      id: event.data.id,
+                      toolName: event.data.toolName,
+                      args: event.data.args,
+                      timestamp: new Date(event.data.timestamp || Date.now()),
+                    };
+                    streamingToolCalls.set(toolCall.id, toolCall);
+                    // Update pending tool calls in real-time
+                    setPendingToolCalls(Array.from(streamingToolCalls.values()));
+                  }
+                } catch (e) {
+                  console.error('Failed to parse tool call event:', e, jsonStr);
+                }
+                // Add remaining text after this tool call event
+                textContent += part.substring(jsonEnd + 1);
+              } else {
+                // Incomplete JSON - buffer it for next chunk
+                toolCallBuffer = '__TOOL_CALL__:' + part;
+              }
+            }
+            
+            assistantContent += textContent;
+          } else if (chunk.includes('__METADATA__:')) {
             const parts = chunk.split('__METADATA__:');
             assistantContent += parts[0];
 
@@ -317,6 +366,7 @@ export default function ChatInterface() {
       setIsLoading(false);
       setPendingToolCalls([]);
       setPendingCodeExecution(null);
+      setStreamingMessageId(null);
       abortControllerRef.current = null;
     }
   };
@@ -564,23 +614,52 @@ export default function ChatInterface() {
               </ConversationEmptyState>
             ) : (
               <ConversationContent className="max-w-4xl mx-auto px-4 py-6">
-                {messages.map((message) => (
-                  <Message key={message.id} from={message.role as 'user' | 'assistant'}>
-                    <MessageContent>
-                      {message.role === 'assistant' ? (
-                        <>
-                          <MessageResponse>{message.content}</MessageResponse>
+                {messages.map((message) => {
+                  const isStreamingMessage = isLoading && message.id === streamingMessageId;
+                  const toolCallsToShow = isStreamingMessage && pendingToolCalls.length > 0 
+                    ? pendingToolCalls 
+                    : message.toolCalls;
+                  
+                  return (
+                    <Message key={message.id} from={message.role as 'user' | 'assistant'}>
+                      <MessageContent>
+                        {message.role === 'assistant' ? (
+                          <>
+                            <MessageResponse>{message.content}</MessageResponse>
 
-                          {/* Render code execution if present */}
-                          {renderCodeExecution(message.codeExecution)}
+                            {/* Render code execution if present */}
+                            {renderCodeExecution(message.codeExecution)}
 
-                          {/* Render tool calls if present */}
-                          {renderToolCalls(message.toolCalls)}
-                        </>
-                      ) : (
-                        <p className="whitespace-pre-wrap">{message.content}</p>
-                      )}
-                    </MessageContent>
+                            {/* Render tool calls - use pending ones if this is the streaming message */}
+                            {renderToolCalls(toolCallsToShow)}
+                            
+                            {/* Show loading indicator and pending code execution inline if streaming */}
+                            {isStreamingMessage && (
+                              <>
+                                {pendingCodeExecution && (
+                                  <div className="mt-4">
+                                    <Card className="p-3 bg-amber-500/5 border-amber-500/20 overflow-hidden">
+                                      <div className="flex items-center gap-2 mb-2">
+                                        <BoxIcon className="h-4 w-4 text-amber-500 animate-pulse" />
+                                        <span className="text-sm font-medium">Sandbox Execution in Progress</span>
+                                      </div>
+                                      <CodeBlock code={pendingCodeExecution.code} language="javascript" />
+                                    </Card>
+                                  </div>
+                                )}
+                                {!pendingCodeExecution && pendingToolCalls.length === 0 && (
+                                  <div className="flex items-center gap-2 text-muted-foreground mt-2">
+                                    <Loader size={16} />
+                                    <span className="text-sm">Thinking...</span>
+                                  </div>
+                                )}
+                              </>
+                            )}
+                          </>
+                        ) : (
+                          <p className="whitespace-pre-wrap">{message.content}</p>
+                        )}
+                      </MessageContent>
 
                     {/* Message Actions for assistant messages */}
                     {message.role === 'assistant' && message.content && !isLoading && (
@@ -598,47 +677,16 @@ export default function ChatInterface() {
                       </MessageActions>
                     )}
                   </Message>
-                ))}
+                  );
+                })}
 
-                {/* Loading state with pending executions */}
-                {isLoading && (
+                {/* Loading state - only show if no streaming message exists yet */}
+                {isLoading && !streamingMessageId && (
                   <Message from="assistant">
                     <MessageContent>
-                      <div>
-                        <div className="flex items-center gap-2 text-muted-foreground">
-                          <Loader size={16} />
-                          <span className="text-sm">
-                            {pendingCodeExecution ? 'Executing code in sandbox...' : 
-                             pendingToolCalls.length > 0 ? `Running ${pendingToolCalls.length} tool(s)...` : 
-                             'Thinking...'}
-                          </span>
-                        </div>
-
-                        {/* Show pending code execution */}
-                        {pendingCodeExecution && (
-                          <Card className="p-3 bg-amber-500/5 border-amber-500/20 overflow-hidden">
-                            <div className="flex items-center gap-2 mb-2">
-                              <BoxIcon className="h-4 w-4 text-amber-500 animate-pulse" />
-                              <span className="text-sm font-medium">Sandbox Execution in Progress</span>
-                            </div>
-                            <CodeBlock code={pendingCodeExecution.code} language="javascript" />
-                          </Card>
-                        )}
-
-                        {/* Show pending tool calls */}
-                        {pendingToolCalls.length > 0 && !pendingCodeExecution && (
-                          <div className="space-y-2">
-                            {pendingToolCalls.map((call) => (
-                              <Tool key={call.id}>
-                                <ToolHeader
-                                  title={call.toolName}
-                                  type="tool-invocation"
-                                  state={call.result ? 'output-available' : 'input-available'}
-                                />
-                              </Tool>
-                            ))}
-                          </div>
-                        )}
+                      <div className="flex items-center gap-2 text-muted-foreground">
+                        <Loader size={16} />
+                        <span className="text-sm">Thinking...</span>
                       </div>
                     </MessageContent>
                   </Message>
