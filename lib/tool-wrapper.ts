@@ -4,9 +4,9 @@ import { ToolOrchestrationSandbox } from './sandbox';
 import { MCPToolBridge, createMCPBridge } from './mcp-bridge';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-type ToolDefinition = { execute?: (...args: any[]) => Promise<any>; description?: string; inputSchema?: z.ZodType };
+type ToolDefinition = Record<string, any>;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-type ToolExecuteFunction = (...args: any[]) => Promise<any>;
+type ToolExecuteFunction = (...args: any[]) => any;
 
 /**
  * Tool wrapper that enables programmatic tool calling using Vercel Sandbox
